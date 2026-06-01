@@ -14,7 +14,16 @@ For more high-resolution demo videos, please visit our <A href="https://mks0601.
 
 
 ## Install
-* To install a conda environment and necessary packages, run below.
+* To install a uv environment and necessary packages, run below. The Python version is fixed by `.python-version` and `pyproject.toml`; package versions are fixed by `uv.lock`.
+```
+uv sync --locked
+source .venv/bin/activate
+```
+* If `uv.lock` needs to be regenerated after intentionally changing dependencies, run below.
+```
+uv lock --python 3.10.16
+```
+* The legacy conda environment is still available for reference.
 ```
 conda env create -f environment.yml
 conda activate h4wpp
@@ -164,4 +173,3 @@ to test Hand4Whole++ with `snapshot_6.pth`.
   year={2026}
 }
 ```
-
