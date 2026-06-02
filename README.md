@@ -17,6 +17,7 @@ For more high-resolution demo videos, please visit our <A href="https://mks0601.
 * To install a uv environment and necessary packages, run below. The Python version is fixed by `.python-version` and `pyproject.toml`; package versions are fixed by `uv.lock`.
 ```
 uv sync --locked
+uv run python tool/patch_torchgeometry.py
 source .venv/bin/activate
 ```
 * If `uv.lock` needs to be regenerated after intentionally changing dependencies, run below.
