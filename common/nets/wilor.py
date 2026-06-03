@@ -2,74 +2,50 @@ import torch
 import torch.nn as nn
 import os
 import os.path as osp
-import numpy as np
-from wilor.models import WiLoR, load_wilor
+from wilor.configs import get_config
+from wilor.models import WiLoR as WiLoRModel
 from wilor.utils.renderer import cam_crop_to_full
-from ultralytics import YOLO 
 from pytorch3d.transforms import matrix_to_axis_angle
-from utils.transforms import restore_bbox
 from utils.mano import mano
 from config import cfg
 
-class WiLoR_det(nn.Module):
-    def __init__(self):
-        super(WiLoR_det, self).__init__()
-        os.chdir(cfg.wilor_root_path)
-        self.detector = YOLO('./pretrained_models/detector.pt')
-        os.chdir(cfg.cur_dir)
-    
-    def forward(self, img):
-        batch_size = img.shape[0]
-        
-        # forward to the hand detector of WiLoR
-        # detect two hands with the highest confidence
-        rhand_bbox, lhand_bbox = [[0,0,1,1] for _ in range(batch_size)], [[0,0,1,1] for _ in range(batch_size)] # initialize with dummy boxes
-        rhand_exist, lhand_exist = [], []
-        for i in range(batch_size):
-            img_cv2 = img[i].detach().cpu().numpy().transpose(1,2,0)[:,:,::-1]*255
-            detections = self.detector(img_cv2, conf=0.3, verbose=False)[0]
-            rhand_bbox_i, rhand_score_i = None, -1
-            lhand_bbox_i, lhand_score_i = None, -1
-            for det in detections: 
-                is_rhand = det.boxes.cls.cpu().detach().squeeze().item()
-                bbox_i = det.boxes.data.cpu().detach().squeeze().numpy()[:4] # xyxy
-                score_i = det.boxes.conf.cpu().detach().squeeze().numpy()
-                if is_rhand and (rhand_score_i < score_i):
-                    rhand_bbox_i = bbox_i
-                    rhand_score_i = score_i
-                elif (not is_rhand) and (lhand_score_i < score_i):
-                    lhand_bbox_i = bbox_i
-                    lhand_score_i = score_i
-            if rhand_bbox_i is not None:
-                rhand_bbox[i] = rhand_bbox_i.tolist()
-                rhand_exist.append(1)
-            else:
-                rhand_exist.append(0)
-            if lhand_bbox_i is not None:
-                lhand_bbox[i] = lhand_bbox_i.tolist()
-                lhand_exist.append(1)
-            else:
-                lhand_exist.append(0)
-        rhand_bbox = torch.FloatTensor(rhand_bbox).cuda().view(batch_size,4)
-        lhand_bbox = torch.FloatTensor(lhand_bbox).cuda().view(batch_size,4)
-        rhand_exist = torch.FloatTensor(rhand_exist).cuda()
-        lhand_exist = torch.FloatTensor(lhand_exist).cuda()
-       
-        # decompose xyxy to center and size
-        rhand_bbox_center, rhand_bbox_size = (rhand_bbox[:,:2] + rhand_bbox[:,2:])/2., (rhand_bbox[:,2:] - rhand_bbox[:,:2])
-        lhand_bbox_center, lhand_bbox_size = (lhand_bbox[:,:2] + lhand_bbox[:,2:])/2., (lhand_bbox[:,2:] - lhand_bbox[:,:2])
-        
-        # extend boxes while preserving the aspect ratio
-        rhand_bbox = restore_bbox(rhand_bbox_center, rhand_bbox_size, cfg.input_hand_shape[1]/cfg.input_hand_shape[0], 2.0).detach()  # xyxy in cfg.input_body_shape space
-        lhand_bbox = restore_bbox(lhand_bbox_center, lhand_bbox_size, cfg.input_hand_shape[1]/cfg.input_hand_shape[0], 2.0).detach()  # xyxy in cfg.input_body_shape space
-        return rhand_bbox, lhand_bbox, rhand_exist, lhand_exist
+
+def load_wilor_from_repo(checkpoint_path, cfg_path):
+    print('Loading ', checkpoint_path)
+    model_cfg = get_config(cfg_path, update_cachedir=True)
+
+    if ('vit' in model_cfg.MODEL.BACKBONE.TYPE) and ('BBOX_SHAPE' not in model_cfg.MODEL):
+        model_cfg.defrost()
+        assert model_cfg.MODEL.IMAGE_SIZE == 256, f"MODEL.IMAGE_SIZE ({model_cfg.MODEL.IMAGE_SIZE}) should be 256 for ViT backbone"
+        model_cfg.MODEL.BBOX_SHAPE = [192, 256]
+        model_cfg.freeze()
+
+    if ('PRETRAINED_WEIGHTS' in model_cfg.MODEL.BACKBONE):
+        model_cfg.defrost()
+        model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
+        model_cfg.freeze()
+
+    if ('DATA_DIR' in model_cfg.MANO):
+        model_cfg.defrost()
+        mano_model_path = osp.join(cfg.human_model_path, 'mano')
+        model_cfg.MANO.DATA_DIR = mano_model_path
+        model_cfg.MANO.MODEL_PATH = mano_model_path
+        model_cfg.MANO.MEAN_PARAMS = osp.join(cfg.wilor_root_path, 'mano_data', 'mano_mean_params.npz')
+        model_cfg.freeze()
+
+    model = WiLoRModel.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg)
+    return model, model_cfg
+
 
 class WiLoR(nn.Module):
     def __init__(self):
         super(WiLoR, self).__init__()
-        os.chdir(cfg.wilor_root_path)
-        self.model, _ = load_wilor(checkpoint_path='./pretrained_models/wilor_final.ckpt', cfg_path='./pretrained_models/model_config.yaml')
-        os.chdir(cfg.cur_dir)
+        cwd = os.getcwd()
+        try:
+            os.chdir(cfg.wilor_root_path)
+            self.model, _ = load_wilor_from_repo(checkpoint_path='./pretrained_models/wilor_final.ckpt', cfg_path='./pretrained_models/model_config.yaml')
+        finally:
+            os.chdir(cwd)
         self.rgb_mean = (0.485, 0.456, 0.406)
         self.rgb_std = (0.229, 0.224, 0.225)
     

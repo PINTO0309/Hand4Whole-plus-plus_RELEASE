@@ -22,8 +22,21 @@ class DWPose(nn.Module):
         self.kpt['part_idx'] = {'body': range(self.kpt['name'].index('Nose'), self.kpt['name'].index('R_Heel')+1),
                             'lhand': range(self.kpt['name'].index('L_Wrist_Hand'), self.kpt['name'].index('L_Pinky_4')+1),
                             'rhand': range(self.kpt['name'].index('R_Wrist_Hand'), self.kpt['name'].index('R_Pinky_4')+1)}
-        self.model = init_model(cfg.dwpose_path['cfg'], cfg.dwpose_path['ckpt'], device='cuda')
+        self.model = self._init_model_from_trusted_checkpoint()
         self.model.cfg.model['test_cfg']['flip_test'] = False
+
+    def _init_model_from_trusted_checkpoint(self):
+        original_torch_load = torch.load
+
+        def torch_load_compat(*args, **kwargs):
+            kwargs.setdefault('weights_only', False)
+            return original_torch_load(*args, **kwargs)
+
+        try:
+            torch.load = torch_load_compat
+            return init_model(cfg.dwpose_path['cfg'], cfg.dwpose_path['ckpt'], device='cuda')
+        finally:
+            torch.load = original_torch_load
 
     def get_bbox_center_size(self, kpt):
         x, y = kpt[:,0], kpt[:,1]
@@ -114,4 +127,3 @@ class DWPose(nn.Module):
         """
 
         return kpt_smplx
-

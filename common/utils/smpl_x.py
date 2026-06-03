@@ -1,7 +1,10 @@
 import numpy as np
 import torch
 import os.path as osp
+import copy
 from config import cfg
+from utils.numpy_compat import patch_numpy_legacy_aliases
+patch_numpy_legacy_aliases()
 import smplx
 import pickle
 from utils.mano import mano
@@ -11,9 +14,10 @@ class SMPLX(object):
         self.layer_arg = {'create_global_orient': False, 'create_body_pose': False, 'create_left_hand_pose': False, 'create_right_hand_pose': False, 'create_jaw_pose': False, 'create_leye_pose': False, 'create_reye_pose': False, 'create_betas': False, 'create_expression': False, 'create_transl': False}
         self.shape_param_dim = 10
         self.expr_param_dim = 10
-        self.layer = {'neutral': smplx.create(cfg.human_model_path, 'smplx', gender='NEUTRAL', num_betas=self.shape_param_dim, use_pca=False, use_face_contour=True, **self.layer_arg),
-                        'male': smplx.create(cfg.human_model_path, 'smplx', gender='MALE', num_betas=self.shape_param_dim, use_pca=False, use_face_contour=True, **self.layer_arg),
-                        'female': smplx.create(cfg.human_model_path, 'smplx', gender='FEMALE', num_betas=self.shape_param_dim, use_pca=False, use_face_contour=True, **self.layer_arg)
+        neutral_layer = smplx.create(cfg.human_model_path, 'smplx', gender='NEUTRAL', num_betas=self.shape_param_dim, use_pca=False, use_face_contour=True, **self.layer_arg)
+        self.layer = {'neutral': neutral_layer,
+                        'male': self._create_layer_or_neutral('MALE', neutral_layer),
+                        'female': self._create_layer_or_neutral('FEMALE', neutral_layer)
                         }
         self.vertex_num = 10475
         self.face = self.layer['neutral'].faces.astype(np.int64)
@@ -23,6 +27,7 @@ class SMPLX(object):
         self.vert_neighbor_idxs = self.get_vert_neighbor()
         self.hand_boundary_idx = {'right': self.hand_vertex_idx['right_hand'][mano.is_boundary['right']==1], 'left': self.hand_vertex_idx['left_hand'][mano.is_boundary['left']==1]}
         self.vert_to_joint = self.layer['neutral'].J_regressor.numpy()
+
         self.vert_to_joint_idx = {'pelvis': 0, 'lwrist': 20, 'rwrist': 21, 'neck': 12}
         with open(osp.join(cfg.human_model_path, 'smplx', 'SMPLX_to_J14.pkl'), 'rb') as f:
             self.vert_to_joint14 = pickle.load(f, encoding='latin1')
@@ -107,7 +112,14 @@ class SMPLX(object):
                                 'lhand': range(self.kpt_hm['name'].index('L_Thumb_1'), self.kpt_hm['name'].index('L_Pinky_4')+1),
                                 'rhand': range(self.kpt_hm['name'].index('R_Thumb_1'), self.kpt_hm['name'].index('R_Pinky_4')+1),
                                 'face': range(self.kpt_hm['name'].index('L_Ear'), self.kpt_hm['name'].index('Nose')+1)}
-        
+
+    def _create_layer_or_neutral(self, gender, neutral_layer):
+        try:
+            return smplx.create(cfg.human_model_path, 'smplx', gender=gender, num_betas=self.shape_param_dim, use_pca=False, use_face_contour=True, **self.layer_arg)
+        except (AssertionError, AttributeError, FileNotFoundError) as e:
+            print('Fallback to neutral SMPL-X layer for {}: {}'.format(gender, e))
+            return copy.deepcopy(neutral_layer)
+
     
     def kpt_to_kpt_hm(self, kpt):
         kpt_hm = []

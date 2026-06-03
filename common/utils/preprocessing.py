@@ -137,9 +137,9 @@ def get_affine_trans_mat(c_x, c_y, src_width, src_height, dst_width, dst_height,
     dst[2, :] = dst_center + dst_rightdir
     
     if inv:
-        trans = cv2.getAffineTransform(np.float32(dst), np.float32(src))
+        trans = cv2.getAffineTransform(dst.astype(np.float32), src.astype(np.float32))
     else:
-        trans = cv2.getAffineTransform(np.float32(src), np.float32(dst))
+        trans = cv2.getAffineTransform(src.astype(np.float32), dst.astype(np.float32))
 
     trans = trans.astype(np.float32)
     return trans
@@ -351,4 +351,3 @@ def process_mano_param(mano_param, cam_param, do_flip, img_shape, rot):
     hand_pose = hand_pose.view(-1,3).numpy() 
     shape_param = shape_param.view(-1).numpy()
     return root_pose, hand_pose, shape_param, kpt_cam, kpt_img, vert_cam
-

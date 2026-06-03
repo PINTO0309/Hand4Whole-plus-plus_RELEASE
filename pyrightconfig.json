@@ -1,0 +1,46 @@
+{
+  "stubPath": "typings",
+  "reportMissingModuleSource": "none",
+  "include": [
+    "demo",
+    "main",
+    "common",
+    "data"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "demo",
+      "extraPaths": [
+        "main",
+        "common",
+        "common/nets/WiLoR"
+      ]
+    },
+    {
+      "root": "main",
+      "extraPaths": [
+        "main",
+        "common",
+        "common/nets/WiLoR",
+        "data"
+      ]
+    },
+    {
+      "root": "common",
+      "extraPaths": [
+        "main",
+        "common",
+        "common/nets/WiLoR"
+      ]
+    },
+    {
+      "root": "data",
+      "extraPaths": [
+        "main",
+        "common",
+        "common/nets/WiLoR",
+        "data"
+      ]
+    }
+  ]
+}

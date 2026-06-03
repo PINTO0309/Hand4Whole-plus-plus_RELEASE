@@ -1,6 +1,8 @@
 *.pth
 *.zip
 *.tar.gz
+*.onnx
+*.pyc
 
 WiLoR/
 mmpose/

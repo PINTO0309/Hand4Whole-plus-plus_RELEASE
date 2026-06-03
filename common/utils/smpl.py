@@ -1,13 +1,19 @@
 import numpy as np
 import torch
 import os.path as osp
+import copy
 from config import cfg
+from utils.numpy_compat import patch_numpy_legacy_aliases
+patch_numpy_legacy_aliases()
 import smplx
 
 class SMPL(object):
     def __init__(self):
         self.layer_arg = {'create_body_pose': False, 'create_betas': False, 'create_global_orient': False, 'create_transl': False}
-        self.layer = {'neutral': smplx.create(cfg.human_model_path, 'smpl', gender='NEUTRAL', **self.layer_arg), 'male': smplx.create(cfg.human_model_path, 'smpl', gender='MALE', **self.layer_arg), 'female': smplx.create(cfg.human_model_path, 'smpl', gender='FEMALE', **self.layer_arg)}
+        neutral_layer = smplx.create(cfg.human_model_path, 'smpl', gender='NEUTRAL', **self.layer_arg)
+        self.layer = {'neutral': neutral_layer,
+                        'male': self._create_layer_or_neutral('MALE', neutral_layer),
+                        'female': self._create_layer_or_neutral('FEMALE', neutral_layer)}
         self.vertex_num = 6890
         self.face = self.layer['neutral'].faces.astype(np.int64)
         self.shape_param_dim = 10
@@ -23,5 +29,12 @@ class SMPL(object):
 
         # keypoint
         self.kpt = self.joint
+
+    def _create_layer_or_neutral(self, gender, neutral_layer):
+        try:
+            return smplx.create(cfg.human_model_path, 'smpl', gender=gender, **self.layer_arg)
+        except (AssertionError, FileNotFoundError) as e:
+            print('Fallback to neutral SMPL layer for {}: {}'.format(gender, e))
+            return copy.deepcopy(neutral_layer)
         
 smpl = SMPL()

@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import os.path as osp
 from config import cfg
+from utils.numpy_compat import patch_numpy_legacy_aliases
+patch_numpy_legacy_aliases()
 import smplx
 from utils.transforms import change_kpt_name
 

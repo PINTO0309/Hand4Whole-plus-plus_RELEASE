@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from typing import Any, cast
 from nets.vit import ViT
 from nets.resnet import ResNetBackbone
 from nets.module import BodyPositionNet, BodyRotationNet, FaceRoI, FaceRegressor, HandRoI, HandControlNet
-from nets.wilor import WiLoR_det, WiLoR
+from nets.wilor import WiLoR
 from nets.dwpose import DWPose
 from nets.loss import PoseLoss, KptImgLoss, KptPelvisRelLoss, KptIHRelLoss, KptPartRelLoss, IHRootPoseReg, IHRelVecLoss
 from utils.smpl_x import smpl_x
@@ -23,7 +24,6 @@ class Model(nn.Module):
         self.face_roi_net = face_roi_net
         self.face_regressor = face_regressor
         self.hand_roi_net = HandRoI()
-        self.wilor_det = WiLoR_det()
         self.wilor = WiLoR().to(dtype=torch.float16) # use half-precision to make it fast
         self.dwpose = DWPose()
         self.hand_control_net = hand_control_net
@@ -244,18 +244,22 @@ def init_weights(m):
             nn.init.normal_(m.weight,std=0.001)
         elif type(m) == nn.Conv2d:
             nn.init.normal_(m.weight,std=0.001)
-            nn.init.constant_(m.bias, 0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
         elif type(m) == nn.BatchNorm2d:
-            nn.init.constant_(m.weight,1)
-            nn.init.constant_(m.bias,0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight,1)
+            if m.bias is not None:
+                nn.init.constant_(m.bias,0)
         elif type(m) == nn.Linear:
             nn.init.normal_(m.weight,std=0.01)
-            nn.init.constant_(m.bias,0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias,0)
     except AttributeError:
         pass
 
 def get_model(mode):
-    encoder = ViT(img_size=cfg.input_body_shape, patch_size=16, embed_dim=cfg.vit_feat_dim, depth=24, num_heads=16, ratio=1, use_checkpoint=False, mlp_ratio=4, qkv_bias=True, drop_path_rate=0.5)
+    encoder = ViT(img_size=cast(Any, cfg.input_body_shape), patch_size=16, embed_dim=cfg.vit_feat_dim, depth=24, num_heads=16, ratio=1, use_checkpoint=False, mlp_ratio=4, qkv_bias=True, drop_path_rate=0.5)
 
     body_position_net = BodyPositionNet(cfg.vit_feat_dim)
     body_rotation_net = BodyRotationNet(cfg.vit_feat_dim)
