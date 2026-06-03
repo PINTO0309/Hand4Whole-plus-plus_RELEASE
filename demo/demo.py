@@ -17,12 +17,14 @@ DETECTOR_CONFIGS = {
         'filename': 'deimv2_dinov3_x_wholebody49_ins_s08_maskhead256x3_center_1240query.onnx',
         'input_name': 'images',
         'input_color': 'rgb',
+        'input_scale': 1.0 / 255.0,
         'dynamic_input': False,
     },
     'hgnetv2-pico': {
         'filename': 'deimv2_hgnetv2_pico_wholebody34_340query_n_batch_640x640.onnx',
         'input_name': 'input_bgr',
         'input_color': 'bgr',
+        'input_scale': 1.0,
         'dynamic_input': True,
     },
 }
@@ -56,6 +58,24 @@ def parse_args() -> argparse.Namespace:
         '--output-video',
         default=None,
         help='Output mp4 path for video or camera mode.',
+    )
+    parser.add_argument(
+        '--output-fps',
+        type=float,
+        default=None,
+        help='FPS for the output MP4. Defaults to the input capture FPS.',
+    )
+    parser.add_argument(
+        '--render-mode',
+        default='mesh',
+        choices=('mesh', 'model-keypoints', 'dwpose-keypoints'),
+        help='Visualization mode for output frames.',
+    )
+    parser.add_argument(
+        '--keypoint-score-thr',
+        type=float,
+        default=0.3,
+        help='Minimum DWPose hand keypoint score drawn in dwpose-keypoints mode.',
     )
     parser.add_argument(
         '--snapshot',
@@ -96,9 +116,10 @@ import numpy as np
 import numpy.typing as npt
 import cv2
 import json
-import onnxruntime as ort
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
+import onnxruntime as ort
 from torch.nn.parallel.data_parallel import DataParallel
 import torch.backends.cudnn as cudnn
 
@@ -121,6 +142,7 @@ ProviderSpec: TypeAlias = str | tuple[str, dict[str, Any]]
 
 class ModelOutput(TypedDict):
     smplx_vert_cam: torch.Tensor
+    smplx_kpt_proj: torch.Tensor
     smplx_root_pose: torch.Tensor
     smplx_body_pose: torch.Tensor
     smplx_lhand_pose: torch.Tensor
@@ -133,6 +155,13 @@ class ModelOutput(TypedDict):
 DETECTOR_INPUT_SHAPE = (640, 640)
 BODY_CLASS_ID = 0
 BODY_DETECTION_SCORE_THRESHOLD = 0.25
+HAND_FINGER_CHAINS = (
+    (0, 1, 2, 3, 4),
+    (0, 5, 6, 7, 8),
+    (0, 9, 10, 11, 12),
+    (0, 13, 14, 15, 16),
+    (0, 17, 18, 19, 20),
+)
 
 
 class LetterboxInfo(TypedDict):
@@ -169,9 +198,10 @@ def build_detector_providers(
         'trt_engine_cache_path': cache_dir,
         'trt_op_types_to_exclude': 'NonMaxSuppression,NonZero,RoiAlign',
     }
-    if trt_precision in ('fp16', 'int8'):
+    if trt_precision == 'fp16':
         trt_options['trt_fp16_enable'] = True
-    if trt_precision == 'int8':
+    elif trt_precision == 'int8':
+        trt_options['trt_fp16_enable'] = True
         trt_options['trt_int8_enable'] = True
         trt_options['trt_int8_calibration_table_name'] = osp.join(cache_dir, 'calibration.flatbuffers')
     elif trt_precision != 'fp32':
@@ -189,7 +219,7 @@ def build_detector_providers(
     return providers
 
 
-def prepare_detector_input(rgb_img: UInt8Array, input_color: str) -> tuple[FloatArray, LetterboxInfo]:
+def prepare_detector_input(rgb_img: UInt8Array, input_color: str, input_scale: float) -> tuple[FloatArray, LetterboxInfo]:
     input_height, input_width = DETECTOR_INPUT_SHAPE
     original_height, original_width = rgb_img.shape[:2]
     scale = min(input_width / original_width, input_height / original_height)
@@ -204,7 +234,7 @@ def prepare_detector_input(rgb_img: UInt8Array, input_color: str) -> tuple[Float
     left = int(round(pad_x - 0.1))
     top = int(round(pad_y - 0.1))
     input_img[top:top + resized_height, left:left + resized_width] = resized_img
-    input_tensor = np.divide(input_img.astype(np.float32), 255.0, dtype=np.float32)
+    input_tensor = input_img.astype(np.float32) * np.float32(input_scale)
     input_tensor = input_tensor.transpose(2, 0, 1)[None]
 
     return cast(FloatArray, input_tensor), {
@@ -267,6 +297,75 @@ def rgb_to_bgr_frame(frame: npt.NDArray[Any]) -> UInt8Array:
     return cast(UInt8Array, cv2.cvtColor(cast(Any, frame), cv2.COLOR_RGB2BGR))
 
 
+def to_uint8_image(img: npt.NDArray[Any]) -> UInt8Array:
+    return cast(UInt8Array, np.clip(np.rint(img), 0, 255).astype(np.uint8))
+
+
+def get_hand_kpt_indices(hand_prefix: str) -> list[int]:
+    return [smpl_x.kpt['name'].index(hand_prefix + '_Wrist')] + [
+        smpl_x.kpt['name'].index(hand_prefix + '_' + finger + '_' + str(joint_idx))
+        for finger in ('Thumb', 'Index', 'Middle', 'Ring', 'Pinky')
+        for joint_idx in range(1, 5)
+    ]
+
+
+def scale_points(points: npt.NDArray[Any], src_shape: tuple[int, int], dst_shape: tuple[int, int]) -> FloatArray:
+    scaled = np.array(points, dtype=np.float32, copy=True)
+    scaled[:, 0] = scaled[:, 0] / float(src_shape[1]) * float(dst_shape[1])
+    scaled[:, 1] = scaled[:, 1] / float(src_shape[0]) * float(dst_shape[0])
+    return cast(FloatArray, scaled)
+
+
+def transform_points(points: npt.NDArray[Any], trans: npt.NDArray[Any]) -> FloatArray:
+    xy1 = np.concatenate((np.asarray(points, dtype=np.float32), np.ones((len(points), 1), dtype=np.float32)), axis=1)
+    return cast(FloatArray, np.dot(np.asarray(trans, dtype=np.float32), xy1.T).T)
+
+
+def is_drawable_point(point: npt.NDArray[Any], width: int, height: int) -> bool:
+    return bool(np.isfinite(point).all() and 0.0 <= point[0] < width and 0.0 <= point[1] < height)
+
+
+def draw_hand_keypoints(
+    bgr_img: UInt8Array,
+    points: npt.NDArray[Any],
+    color: tuple[int, int, int],
+    scores: npt.NDArray[Any] | None = None,
+    score_thr: float = 0.0,
+) -> UInt8Array:
+    out = bgr_img.copy()
+    height, width = out.shape[:2]
+    valid = np.array([is_drawable_point(points[idx], width, height) for idx in range(len(points))], dtype=np.bool_)
+    if scores is not None:
+        valid = valid & (np.asarray(scores, dtype=np.float32) >= np.float32(score_thr))
+
+    line_color = tuple(int(round(channel * 0.75)) for channel in color)
+    for chain in HAND_FINGER_CHAINS:
+        for src_idx, dst_idx in zip(chain[:-1], chain[1:]):
+            if valid[src_idx] and valid[dst_idx]:
+                src = (int(round(float(points[src_idx, 0]))), int(round(float(points[src_idx, 1]))))
+                dst = (int(round(float(points[dst_idx, 0]))), int(round(float(points[dst_idx, 1]))))
+                cv2.line(out, src, dst, line_color, 2, lineType=cv2.LINE_AA)
+    for idx in range(len(points)):
+        if valid[idx]:
+            center = (int(round(float(points[idx, 0]))), int(round(float(points[idx, 1]))))
+            cv2.circle(out, center, 3, color, thickness=-1, lineType=cv2.LINE_AA)
+    return out
+
+
+def draw_two_hand_keypoints(
+    original_img: UInt8Array,
+    left_points: npt.NDArray[Any],
+    right_points: npt.NDArray[Any],
+    left_scores: npt.NDArray[Any] | None = None,
+    right_scores: npt.NDArray[Any] | None = None,
+    score_thr: float = 0.0,
+) -> UInt8Array:
+    out = rgb_to_bgr_frame(original_img)
+    out = draw_hand_keypoints(out, left_points, (178, 255, 178), left_scores, score_thr)
+    out = draw_hand_keypoints(out, right_points, (255, 178, 153), right_scores, score_thr)
+    return out
+
+
 def scaled_color(color: Color, scale: float) -> FloatArray:
     return np.array([c * scale for c in color], dtype=np.float32).reshape(1,3)
 
@@ -308,24 +407,61 @@ def save_smplx_params(out: ModelOutput, file_name: str) -> None:
                 'expr': flatten_float_array(expr)}, f)
 
 
+def draw_model_keypoint_overlay(original_img: UInt8Array, out: ModelOutput, bb2img_trans: npt.NDArray[Any]) -> UInt8Array:
+    kpt_proj = tensor_batch_item_to_numpy(out['smplx_kpt_proj'])
+    lhand = transform_points(scale_points(kpt_proj[lhand_kpt_idx], cfg.vit_output_shape, cfg.input_img_shape), bb2img_trans)
+    rhand = transform_points(scale_points(kpt_proj[rhand_kpt_idx], cfg.vit_output_shape, cfg.input_img_shape), bb2img_trans)
+    return draw_two_hand_keypoints(original_img, lhand, rhand)
+
+
+def draw_dwpose_keypoint_overlay(original_img: UInt8Array, img: torch.Tensor, bb2img_trans: npt.NDArray[Any]) -> UInt8Array:
+    body_img = F.interpolate(img, cfg.input_body_shape, mode='bilinear')
+    with torch.no_grad():
+        dwpose_kpt = model.module.dwpose(body_img)
+    dwpose_np = tensor_batch_item_to_numpy(dwpose_kpt)
+    lhand = transform_points(scale_points(dwpose_np[lhand_kpt_idx, :2], cfg.input_body_shape, cfg.input_img_shape), bb2img_trans)
+    rhand = transform_points(scale_points(dwpose_np[rhand_kpt_idx, :2], cfg.input_body_shape, cfg.input_img_shape), bb2img_trans)
+    return draw_two_hand_keypoints(
+        original_img,
+        lhand,
+        rhand,
+        dwpose_np[lhand_kpt_idx, 2],
+        dwpose_np[rhand_kpt_idx, 2],
+        keypoint_score_thr,
+    )
+
+
 def process_frame(original_img: UInt8Array, frame_name: str, save_static_outputs: bool) -> UInt8Array | None:
-    detector_input, letterbox_info = prepare_detector_input(original_img, detector_input_color)
+    detector_input, letterbox_info = prepare_detector_input(original_img, detector_input_color, detector_input_scale)
     detector_output = cast(DetectorOutput, detector.run([detector_output_name], {detector_input_name: detector_input})[0])
     person_bbox = get_body_box_from_detector_output(detector_output, letterbox_info)
     if person_bbox is None:
         return None
 
     bbox = cast(FloatArray, set_aspect_ratio(person_bbox, cfg.input_img_shape[1]/cfg.input_img_shape[0]))
-    patch_img, _img2bb_trans, _bb2img_trans = get_patch_img(original_img, bbox, 1.0, 0.0, False, cfg.input_img_shape)
+    patch_img, _img2bb_trans, bb2img_trans = get_patch_img(original_img, bbox, 1.0, 0.0, False, cfg.input_img_shape)
     patch_img = cast(FloatArray, patch_img)
     img = transform(patch_img.astype(np.float32)).div(255.0)
     img = img.cuda()[None,:,:,:]
+
+    if render_mode == 'dwpose-keypoints':
+        rendered_img = draw_dwpose_keypoint_overlay(original_img, img, bb2img_trans)
+        if save_static_outputs:
+            cv2.imwrite(osp.join(output_root_path, frame_name + '_render_original_img.jpg'), rendered_img)
+        return rendered_img
 
     inputs: dict[str, torch.Tensor] = {'img': img}
     targets: dict[str, Any] = {}
     meta_info: dict[str, Any] = {}
     with torch.no_grad():
         out = cast(ModelOutput, model(inputs, targets, meta_info, 'test'))
+
+    if render_mode == 'model-keypoints':
+        rendered_img = draw_model_keypoint_overlay(original_img, out, bb2img_trans)
+        if save_static_outputs:
+            cv2.imwrite(osp.join(output_root_path, frame_name + '_render_original_img.jpg'), rendered_img)
+        return rendered_img
+
     vert = tensor_batch_item_to_numpy(out['smplx_vert_cam'])
 
     if save_static_outputs:
@@ -337,7 +473,7 @@ def process_frame(original_img: UInt8Array, frame_name: str, save_static_outputs
         vis_img = img.cpu().numpy()[0].transpose(1,2,0).copy() * 255
         focal = [cfg.focal[0] / cfg.input_body_shape[1] * cfg.input_img_shape[1], cfg.focal[1] / cfg.input_body_shape[0] * cfg.input_img_shape[0]]
         princpt = [cfg.princpt[0] / cfg.input_body_shape[1] * cfg.input_img_shape[1], cfg.princpt[1] / cfg.input_body_shape[0] * cfg.input_img_shape[0]]
-        rendered_cropped_img = render_mesh(vert, smpl_x.face, {'focal': focal, 'princpt': princpt}, vis_img)[:,:,::-1]
+        rendered_cropped_img = to_uint8_image(render_mesh(vert, smpl_x.face, {'focal': focal, 'princpt': princpt}, vis_img)[:,:,::-1])
         cv2.imwrite(osp.join(output_root_path, frame_name + '_render_cropped_img.jpg'), rendered_cropped_img)
 
         save_smplx_params(out, osp.join(output_root_path, frame_name + '_smplx_param.json'))
@@ -348,7 +484,7 @@ def process_frame(original_img: UInt8Array, frame_name: str, save_static_outputs
     render_color = torch.ones((1,smpl_x.vertex_num,3)).float().cuda()
     render_color[:,smpl_x.hand_vertex_idx['right_hand'],:] = torch.FloatTensor(rhand_color).cuda()[None,:]
     render_color[:,smpl_x.hand_vertex_idx['left_hand'],:] = torch.FloatTensor(lhand_color).cuda()[None,:]
-    rendered_img = render_mesh(vert, smpl_x.face, {'focal': focal, 'princpt': princpt}, vis_img, color=render_color)[:,:,::-1]
+    rendered_img = to_uint8_image(render_mesh(vert, smpl_x.face, {'focal': focal, 'princpt': princpt}, vis_img, color=render_color)[:,:,::-1])
 
     if save_static_outputs:
         cv2.imwrite(osp.join(output_root_path, frame_name + '_render_original_img.jpg'), rendered_img)
@@ -378,7 +514,11 @@ def get_default_output_video_path(video_path: str | None, camera_id: int | None)
     return osp.join(output_root_path, camera_name + '_render.mp4')
 
 
-def get_capture_fps(capture: Any) -> float:
+def get_capture_fps(capture: Any, output_fps: float | None = None) -> float:
+    if output_fps is not None:
+        if output_fps <= 0.0:
+            raise ValueError('--output-fps must be greater than 0.')
+        return output_fps
     fps = float(capture.get(cv2.CAP_PROP_FPS))
     if fps <= 0.0 or fps != fps:
         return 30.0
@@ -394,11 +534,12 @@ def create_video_writer(output_video_path: str, fps: float, frame_width: int, fr
     return writer
 
 
-def run_capture(capture: Any, output_video_path: str, source_name: str, show_gui: bool = False) -> None:
-    fps = get_capture_fps(capture)
+def run_capture(capture: Any, output_video_path: str, source_name: str, output_fps: float | None = None, show_gui: bool = False) -> None:
+    fps = get_capture_fps(capture, output_fps)
     writer: Any | None = None
     frame_idx = 0
     window_name = 'Hand4Whole++ Demo'
+    window_created = False
     try:
         with tqdm(desc=source_name, unit='frame') as progress:
             while True:
@@ -420,6 +561,7 @@ def run_capture(capture: Any, output_video_path: str, source_name: str, show_gui
                 writer.write(output_frame)
                 if show_gui:
                     cv2.imshow(window_name, cast(Any, output_frame))
+                    window_created = True
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q') or key == 27:
                         break
@@ -431,22 +573,22 @@ def run_capture(capture: Any, output_video_path: str, source_name: str, show_gui
         capture.release()
         if writer is not None:
             writer.release()
-        if show_gui:
+        if show_gui and window_created:
             cv2.destroyWindow(window_name)
 
 
-def run_video(video_path: str, output_video_path: str) -> None:
+def run_video(video_path: str, output_video_path: str, output_fps: float | None = None) -> None:
     capture = cv2.VideoCapture(video_path)
     if not capture.isOpened():
         raise IOError('Fail to open video {}'.format(video_path))
-    run_capture(capture, output_video_path, osp.basename(video_path))
+    run_capture(capture, output_video_path, osp.basename(video_path), output_fps)
 
 
-def run_camera(camera_id: int, output_video_path: str) -> None:
+def run_camera(camera_id: int, output_video_path: str, output_fps: float | None = None) -> None:
     capture = cv2.VideoCapture(camera_id)
     if not capture.isOpened():
         raise IOError('Fail to open camera {}'.format(camera_id))
-    run_capture(capture, output_video_path, 'camera_{}'.format(camera_id), show_gui=True)
+    run_capture(capture, output_video_path, 'camera_{}'.format(camera_id), output_fps, show_gui=True)
 
 
 root_path = demo_dir
@@ -455,6 +597,12 @@ output_root_path = osp.abspath(cast(str, args.output_dir))
 os.makedirs(output_root_path, exist_ok=True)
 rhand_color: Color = (0.6, 0.7, 1.0)
 lhand_color: Color = (0.7, 1.0, 0.7)
+render_mode = cast(str, args.render_mode)
+keypoint_score_thr = cast(float, args.keypoint_score_thr)
+if keypoint_score_thr < 0.0:
+    raise ValueError('--keypoint-score-thr must be greater than or equal to 0.')
+lhand_kpt_idx = get_hand_kpt_indices('L')
+rhand_kpt_idx = get_hand_kpt_indices('R')
 
 
 # snapshot load
@@ -476,6 +624,7 @@ detector_config = DETECTOR_CONFIGS[detector_name]
 detector_path = osp.join(root_path, cast(str, detector_config['filename']))
 detector_backend = cast(str, args.detector_backend)
 detector_input_color = cast(str, detector_config['input_color'])
+detector_input_scale = cast(float, detector_config['input_scale'])
 detector_trt_precision = cast(str, args.detector_trt_precision)
 detector_trt_cache_dir = cast(str | None, args.detector_trt_cache_dir)
 detector_trt_cache_dir = detector_trt_cache_dir if detector_trt_cache_dir is not None else osp.join(output_root_path, 'trt_engine_cache')
@@ -491,6 +640,8 @@ print('Load body detector from {} using {}'.format(detector_path, detector_backe
 detector = ort.InferenceSession(detector_path, providers=detector_providers)
 if detector_backend == 'tensorrt' and 'TensorrtExecutionProvider' not in detector.get_providers():
     raise RuntimeError('TensorRT detector backend was requested but the session did not enable TensorrtExecutionProvider.')
+if detector_backend == 'cuda' and 'CUDAExecutionProvider' not in detector.get_providers():
+    print('CUDA detector backend was requested but the session did not enable CUDAExecutionProvider; using {}.'.format(detector.get_providers()))
 print('Detector providers: {}'.format(detector.get_providers()))
 detector_input_name = detector.get_inputs()[0].name
 detector_output_name = detector.get_outputs()[0].name
@@ -500,10 +651,11 @@ transform = transforms.ToTensor()
 video_path = cast(str | None, args.video_path)
 camera_id = cast(int | None, args.camera_id)
 output_video = cast(str | None, args.output_video)
+output_fps = cast(float | None, args.output_fps)
 
 if video_path is not None:
-    run_video(video_path, output_video if output_video is not None else get_default_output_video_path(video_path, None))
+    run_video(video_path, output_video if output_video is not None else get_default_output_video_path(video_path, None), output_fps)
 elif camera_id is not None:
-    run_camera(camera_id, output_video if output_video is not None else get_default_output_video_path(None, camera_id))
+    run_camera(camera_id, output_video if output_video is not None else get_default_output_video_path(None, camera_id), output_fps)
 else:
     run_image_dir(input_root_path)

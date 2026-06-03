@@ -34,6 +34,20 @@ Still-image mode saves:
 - `*_render_original_img.jpg`: render on the original image
 - `*_smplx_param.json`: SMPL-X parameters
 
+In keypoint render modes, still-image mode saves only `*_render_original_img.jpg`.
+
+## Render Mode
+
+Choose the output visualization with `--render-mode`:
+
+```bash
+python demo/demo.py --render-mode mesh
+python demo/demo.py --render-mode model-keypoints
+python demo/demo.py --render-mode dwpose-keypoints
+```
+
+`mesh` renders the SMPL-X mesh. `model-keypoints` draws the Hand4Whole++ model hand keypoints. `dwpose-keypoints` draws DWPose 2D hand detections and uses `--keypoint-score-thr` to filter low-confidence points.
+
 ## Video File
 
 Run inference on a video file:
@@ -52,17 +66,22 @@ Run inference from a USB camera:
 python demo/demo.py \
 --camera-id 0 \
 --output-video demo/outputs/camera_0_render.mp4 \
+--output-fps 5 \
+--render-mode model-keypoints \
 --detector hgnetv2-pico \
---detector-backend tensorrt
+--detector-backend cuda
 
 python demo/demo.py \
 --camera-id 0 \
 --output-video demo/outputs/camera_0_render.mp4 \
+--output-fps 5 \
+--render-mode dwpose-keypoints \
 --detector dinov3-x \
 --detector-backend tensorrt
 ```
 
 Camera mode shows an OpenCV preview window and saves the rendered MP4. Stop the process with `q`, Esc, or `Ctrl+C`.
+Use `--output-fps 5` to write the MP4 at 5 frames per second.
 
 ## Snapshot Selection
 
