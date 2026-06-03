@@ -1,1 +1,4 @@
 *.pth
+
+WiLoR/
+mmpose/
