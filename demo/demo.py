@@ -15,11 +15,15 @@ SNAPSHOT_PATHS = {
 DETECTOR_CONFIGS = {
     'dinov3-x': {
         'filename': 'deimv2_dinov3_x_wholebody49_ins_s08_maskhead256x3_center_1240query.onnx',
+        'input_name': 'images',
         'input_color': 'rgb',
+        'dynamic_input': False,
     },
     'hgnetv2-pico': {
         'filename': 'deimv2_hgnetv2_pico_wholebody34_340query_n_batch_640x640.onnx',
+        'input_name': 'input_bgr',
         'input_color': 'bgr',
+        'dynamic_input': True,
     },
 }
 
@@ -65,6 +69,23 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(DETECTOR_CONFIGS.keys()),
         help='ONNX body detector preset to load.',
     )
+    parser.add_argument(
+        '--detector-backend',
+        default='cuda',
+        choices=('cuda', 'tensorrt', 'cpu'),
+        help='Execution backend for the ONNX body detector.',
+    )
+    parser.add_argument(
+        '--detector-trt-precision',
+        default='fp16',
+        choices=('fp32', 'fp16', 'int8'),
+        help='TensorRT precision mode used when --detector-backend tensorrt is selected.',
+    )
+    parser.add_argument(
+        '--detector-trt-cache-dir',
+        default=None,
+        help='TensorRT engine cache directory. Defaults to <output-dir>/trt_engine_cache.',
+    )
     return parser.parse_args()
 
 
@@ -95,6 +116,7 @@ IntArray: TypeAlias = npt.NDArray[np.int64]
 BBox: TypeAlias = list[float]
 Color: TypeAlias = tuple[float, float, float]
 DetectorOutput: TypeAlias = npt.NDArray[np.float32]
+ProviderSpec: TypeAlias = str | tuple[str, dict[str, Any]]
 
 
 class ModelOutput(TypedDict):
@@ -119,6 +141,52 @@ class LetterboxInfo(TypedDict):
     pad_y: float
     original_width: int
     original_height: int
+
+
+def build_detector_providers(
+    backend: str,
+    cache_dir: str,
+    trt_precision: str,
+    input_name: str,
+    dynamic_input: bool,
+) -> list[ProviderSpec]:
+    available_providers = ort.get_available_providers()
+    if backend == 'cpu':
+        return ['CPUExecutionProvider']
+    if backend == 'cuda':
+        if 'CUDAExecutionProvider' in available_providers:
+            return ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        print('CUDAExecutionProvider is not available; falling back to CPUExecutionProvider.')
+        return ['CPUExecutionProvider']
+    if backend != 'tensorrt':
+        raise ValueError('Unsupported detector backend: {}'.format(backend))
+    if 'TensorrtExecutionProvider' not in available_providers:
+        raise RuntimeError('TensorrtExecutionProvider is not available in this onnxruntime build.')
+
+    os.makedirs(cache_dir, exist_ok=True)
+    trt_options: dict[str, Any] = {
+        'trt_engine_cache_enable': True,
+        'trt_engine_cache_path': cache_dir,
+        'trt_op_types_to_exclude': 'NonMaxSuppression,NonZero,RoiAlign',
+    }
+    if trt_precision in ('fp16', 'int8'):
+        trt_options['trt_fp16_enable'] = True
+    if trt_precision == 'int8':
+        trt_options['trt_int8_enable'] = True
+        trt_options['trt_int8_calibration_table_name'] = osp.join(cache_dir, 'calibration.flatbuffers')
+    elif trt_precision != 'fp32':
+        raise ValueError('Unsupported TensorRT precision: {}'.format(trt_precision))
+    if dynamic_input:
+        profile_shape = '{}:1x3x{}x{}'.format(input_name, DETECTOR_INPUT_SHAPE[0], DETECTOR_INPUT_SHAPE[1])
+        trt_options['trt_profile_min_shapes'] = profile_shape
+        trt_options['trt_profile_opt_shapes'] = profile_shape
+        trt_options['trt_profile_max_shapes'] = profile_shape
+
+    providers: list[ProviderSpec] = [('TensorrtExecutionProvider', trt_options)]
+    if 'CUDAExecutionProvider' in available_providers:
+        providers.append('CUDAExecutionProvider')
+    providers.append('CPUExecutionProvider')
+    return providers
 
 
 def prepare_detector_input(rgb_img: UInt8Array, input_color: str) -> tuple[FloatArray, LetterboxInfo]:
@@ -405,13 +473,25 @@ cudnn.benchmark = True
 # body detector
 detector_name = cast(str, args.detector)
 detector_config = DETECTOR_CONFIGS[detector_name]
-detector_path = osp.join(root_path, detector_config['filename'])
-detector_input_color = detector_config['input_color']
+detector_path = osp.join(root_path, cast(str, detector_config['filename']))
+detector_backend = cast(str, args.detector_backend)
+detector_input_color = cast(str, detector_config['input_color'])
+detector_trt_precision = cast(str, args.detector_trt_precision)
+detector_trt_cache_dir = cast(str | None, args.detector_trt_cache_dir)
+detector_trt_cache_dir = detector_trt_cache_dir if detector_trt_cache_dir is not None else osp.join(output_root_path, 'trt_engine_cache')
 assert osp.exists(detector_path), 'Cannot find body detector at ' + detector_path
-available_providers = ort.get_available_providers()
-detector_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in available_providers else ['CPUExecutionProvider']
-print('Load body detector from {}'.format(detector_path))
+detector_providers = build_detector_providers(
+    detector_backend,
+    detector_trt_cache_dir,
+    detector_trt_precision,
+    cast(str, detector_config['input_name']),
+    cast(bool, detector_config['dynamic_input']),
+)
+print('Load body detector from {} using {}'.format(detector_path, detector_backend))
 detector = ort.InferenceSession(detector_path, providers=detector_providers)
+if detector_backend == 'tensorrt' and 'TensorrtExecutionProvider' not in detector.get_providers():
+    raise RuntimeError('TensorRT detector backend was requested but the session did not enable TensorrtExecutionProvider.')
+print('Detector providers: {}'.format(detector.get_providers()))
 detector_input_name = detector.get_inputs()[0].name
 detector_output_name = detector.get_outputs()[0].name
 

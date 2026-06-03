@@ -49,7 +49,17 @@ Video mode saves only the rendered MP4. If no body is detected in a frame, the o
 Run inference from a USB camera:
 
 ```bash
-python demo/demo.py --camera-id 0 --output-video demo/outputs/camera_0_render.mp4
+python demo/demo.py \
+--camera-id 0 \
+--output-video demo/outputs/camera_0_render.mp4 \
+--detector hgnetv2-pico \
+--detector-backend tensorrt
+
+python demo/demo.py \
+--camera-id 0 \
+--output-video demo/outputs/camera_0_render.mp4 \
+--detector dinov3-x \
+--detector-backend tensorrt
 ```
 
 Camera mode shows an OpenCV preview window and saves the rendered MP4. Stop the process with `q`, Esc, or `Ctrl+C`.
@@ -75,6 +85,26 @@ python demo/demo.py --detector hgnetv2-pico
 ```
 
 The default is `dinov3-x`. Both detector presets use `classid=0` as the body class.
+
+Choose the ONNX execution backend with `--detector-backend`:
+
+```bash
+python demo/demo.py --detector hgnetv2-pico --detector-backend cuda
+python demo/demo.py --detector hgnetv2-pico --detector-backend tensorrt
+python demo/demo.py --detector hgnetv2-pico --detector-backend cpu
+```
+
+TensorRT mode uses ONNX Runtime's `TensorrtExecutionProvider`, enables engine caching, and defaults to FP16:
+
+```bash
+python demo/demo.py \
+--video-path sample.mp4 \
+--detector hgnetv2-pico \
+--detector-backend tensorrt \
+--detector-trt-precision fp16
+```
+
+The TensorRT cache directory defaults to `demo/outputs/trt_engine_cache`. Use `--detector-trt-cache-dir PATH` to override it. The first TensorRT run can take longer while the engine is built; later runs reuse the cache when compatible.
 
 ## Output Directory
 
