@@ -1,4 +1,6 @@
 *.pth
+*.zip
+*.tar.gz
 
 WiLoR/
 mmpose/
