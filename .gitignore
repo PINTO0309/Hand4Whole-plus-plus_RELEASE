@@ -5,3 +5,8 @@
 WiLoR/
 mmpose/
 __pycache__/
+smpl/
+smplx/
+mano/
+flame/
+outputs/
