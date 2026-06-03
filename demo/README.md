@@ -7,6 +7,7 @@ This demo runs Hand4Whole++ inference on still images, an MP4/video file, or a U
 Place these files under `demo/`:
 
 - `deimv2_dinov3_x_wholebody49_ins_s08_maskhead256x3_center_1240query.onnx`
+- `deimv2_hgnetv2_pico_wholebody34_340query_n_batch_640x640.onnx`
 - `IH26M+ReIH+ARCTIC/snapshot_6.pth`
 - `IH26M+ReIH+ARCTIC+AGORA/snapshot_6.pth`
 
@@ -63,6 +64,17 @@ python demo/demo.py --snapshot IH26M+ReIH+ARCTIC+AGORA
 ```
 
 The default is `IH26M+ReIH+ARCTIC`.
+
+## Body Detector Selection
+
+Choose the ONNX body detector with `--detector`:
+
+```bash
+python demo/demo.py --detector dinov3-x
+python demo/demo.py --detector hgnetv2-pico
+```
+
+The default is `dinov3-x`. Both detector presets use `classid=0` as the body class.
 
 ## Output Directory
 

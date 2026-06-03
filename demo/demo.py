@@ -12,6 +12,16 @@ SNAPSHOT_PATHS = {
     'IH26M+ReIH+ARCTIC': osp.join('IH26M+ReIH+ARCTIC', 'snapshot_6.pth'),
     'IH26M+ReIH+ARCTIC+AGORA': osp.join('IH26M+ReIH+ARCTIC+AGORA', 'snapshot_6.pth'),
 }
+DETECTOR_CONFIGS = {
+    'dinov3-x': {
+        'filename': 'deimv2_dinov3_x_wholebody49_ins_s08_maskhead256x3_center_1240query.onnx',
+        'input_color': 'rgb',
+    },
+    'hgnetv2-pico': {
+        'filename': 'deimv2_hgnetv2_pico_wholebody34_340query_n_batch_640x640.onnx',
+        'input_color': 'bgr',
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         default='IH26M+ReIH+ARCTIC',
         choices=tuple(SNAPSHOT_PATHS.keys()),
         help='Snapshot preset to load.',
+    )
+    parser.add_argument(
+        '--detector',
+        default='dinov3-x',
+        choices=tuple(DETECTOR_CONFIGS.keys()),
+        help='ONNX body detector preset to load.',
     )
     return parser.parse_args()
 
@@ -105,7 +121,7 @@ class LetterboxInfo(TypedDict):
     original_height: int
 
 
-def prepare_detector_input(rgb_img: UInt8Array) -> tuple[FloatArray, LetterboxInfo]:
+def prepare_detector_input(rgb_img: UInt8Array, input_color: str) -> tuple[FloatArray, LetterboxInfo]:
     input_height, input_width = DETECTOR_INPUT_SHAPE
     original_height, original_width = rgb_img.shape[:2]
     scale = min(input_width / original_width, input_height / original_height)
@@ -114,7 +130,8 @@ def prepare_detector_input(rgb_img: UInt8Array) -> tuple[FloatArray, LetterboxIn
     pad_x = (input_width - resized_width) / 2.0
     pad_y = (input_height - resized_height) / 2.0
 
-    resized_img = cast(UInt8Array, cv2.resize(cast(Any, rgb_img), (resized_width, resized_height), interpolation=cv2.INTER_LINEAR))
+    detector_img = rgb_img if input_color == 'rgb' else np.ascontiguousarray(rgb_img[:, :, ::-1])
+    resized_img = cast(UInt8Array, cv2.resize(cast(Any, detector_img), (resized_width, resized_height), interpolation=cv2.INTER_LINEAR))
     input_img = np.full((input_height, input_width, 3), 114, dtype=np.uint8)
     left = int(round(pad_x - 0.1))
     top = int(round(pad_y - 0.1))
@@ -224,7 +241,7 @@ def save_smplx_params(out: ModelOutput, file_name: str) -> None:
 
 
 def process_frame(original_img: UInt8Array, frame_name: str, save_static_outputs: bool) -> UInt8Array | None:
-    detector_input, letterbox_info = prepare_detector_input(original_img)
+    detector_input, letterbox_info = prepare_detector_input(original_img, detector_input_color)
     detector_output = cast(DetectorOutput, detector.run([detector_output_name], {detector_input_name: detector_input})[0])
     person_bbox = get_body_box_from_detector_output(detector_output, letterbox_info)
     if person_bbox is None:
@@ -386,10 +403,14 @@ for module in model.module.trainable_modules+model.module.eval_modules:
 cudnn.benchmark = True
 
 # body detector
-detector_path = osp.join(root_path, 'deimv2_dinov3_x_wholebody49_ins_s08_maskhead256x3_center_1240query.onnx')
+detector_name = cast(str, args.detector)
+detector_config = DETECTOR_CONFIGS[detector_name]
+detector_path = osp.join(root_path, detector_config['filename'])
+detector_input_color = detector_config['input_color']
 assert osp.exists(detector_path), 'Cannot find body detector at ' + detector_path
 available_providers = ort.get_available_providers()
 detector_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in available_providers else ['CPUExecutionProvider']
+print('Load body detector from {}'.format(detector_path))
 detector = ort.InferenceSession(detector_path, providers=detector_providers)
 detector_input_name = detector.get_inputs()[0].name
 detector_output_name = detector.get_outputs()[0].name
